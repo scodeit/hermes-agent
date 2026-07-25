@@ -2633,6 +2633,50 @@ def delegate_task(
             effective_provider_override = t.get("provider") or provider or creds["provider"]
             effective_reasoning_effort = t.get("reasoning_effort") or reasoning_effort or None
 
+            # ── Resolve per-call provider credentials ──────────────────
+            # When a per-call provider override differs from the configured
+            # delegation.provider (or is set while none is configured),
+            # resolve the full credential bundle (base_url, api_key, api_mode)
+            # from the provider's config.  Without this a per-call provider
+            # change inherits the parent's base_url and routes to the wrong
+            # endpoint (issue discovered with custom:gonka override).
+            per_call_base_url = creds["base_url"]
+            per_call_api_key = creds["api_key"]
+            per_call_api_mode = creds["api_mode"]
+            per_call_request_overrides = creds.get("request_overrides")
+            per_call_max_tokens = creds.get("max_output_tokens")
+            per_call_acp_command = creds.get("command")
+            per_call_acp_args = creds.get("args")
+
+            if effective_provider_override and effective_provider_override != creds.get("provider"):
+                try:
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                    per_call_runtime = resolve_runtime_provider(
+                        requested=effective_provider_override,
+                        target_model=effective_model,
+                    )
+                    per_call_base_url = per_call_runtime.get("base_url") or per_call_base_url
+                    per_call_api_key = per_call_runtime.get("api_key") or per_call_api_key
+                    per_call_api_mode = per_call_runtime.get("api_mode") or per_call_api_mode
+                    per_call_request_overrides = (
+                        dict(per_call_runtime.get("request_overrides") or {})
+                        or per_call_request_overrides
+                    )
+                    per_call_max_tokens = (
+                        per_call_runtime.get("max_output_tokens") or per_call_max_tokens
+                    )
+                    per_call_acp_command = per_call_runtime.get("command") or per_call_acp_command
+                    per_call_acp_args = (
+                        list(per_call_runtime.get("args") or []) or per_call_acp_args
+                    )
+                except Exception as _pc_exc:
+                    logger.warning(
+                        "Could not resolve per-call provider '%s': %s; "
+                        "falling back to inherited credentials.",
+                        effective_provider_override, _pc_exc,
+                    )
+
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2645,13 +2689,13 @@ def delegate_task(
                 task_count=n_tasks,
                 parent_agent=parent_agent,
                 override_provider=effective_provider_override,
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_base_url=per_call_base_url,
+                override_api_key=per_call_api_key,
+                override_api_mode=per_call_api_mode,
+                override_request_overrides=per_call_request_overrides,
+                override_max_tokens=per_call_max_tokens,
+                override_acp_command=per_call_acp_command,
+                override_acp_args=per_call_acp_args,
                 role=effective_role,
                 override_reasoning_effort=effective_reasoning_effort,
             )
