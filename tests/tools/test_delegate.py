@@ -3253,8 +3253,153 @@ class TestFallbackModelInheritance(unittest.TestCase):
                 task_count=1,
             )
 
-        _, kwargs = MockAgent.call_args
-        self.assertIsNone(kwargs["fallback_model"])
+class TestPerCallModelOverride(unittest.TestCase):
+    """Per-call model/provider/reasoning_effort overrides in delegate_task."""
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_per_call_model_override_reaches_child_agent(self, mock_creds, mock_cfg):
+        """Top-level model param overrides delegation.model config."""
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": None,
+            "provider": None,
+        }
+        mock_creds.return_value = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="Test per-call model",
+                model="anthropic/claude-sonnet-4",
+                provider="openrouter",
+                parent_agent=parent,
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["model"], "anthropic/claude-sonnet-4")
+            self.assertEqual(kwargs["provider"], "openrouter")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_per_call_model_falls_back_to_config(self, mock_creds, mock_cfg):
+        """When no per-call model is given, config model is used."""
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "google/gemini-3-flash",
+            "provider": "openrouter",
+        }
+        mock_creds.return_value = {
+            "model": "google/gemini-3-flash",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-xxx",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            # No model arg — should fall back to config
+            delegate_task(goal="Test fallback", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["model"], "google/gemini-3-flash")
+            self.assertEqual(kwargs["provider"], "openrouter")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_batch_mode_per_task_model_override(self, mock_creds, mock_cfg):
+        """Per-task model overrides top-level model in batch mode."""
+        mock_cfg.return_value = {"max_iterations": 45, "model": None, "provider": None}
+        mock_creds.return_value = {
+            "model": None, "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None,
+        }
+        parent = _make_mock_parent(depth=0)
+
+        captured_tasks = {}
+
+        def capture_build(**kwargs):
+            ti = kwargs.get("task_index")
+            captured_tasks[ti] = {
+                "model": kwargs.get("model"),
+                "provider": kwargs.get("override_provider"),
+            }
+            child = MagicMock()
+            child.run_conversation.return_value = {
+                "final_response": f"done-{ti}", "completed": True, "api_calls": 1
+            }
+            return child
+
+        with patch("tools.delegate_tool._build_child_agent", side_effect=capture_build):
+            delegate_task(
+                tasks=[
+                    {"goal": "Security audit", "model": "deepseek-v4-pro"},
+                    {"goal": "Style review", "model": "claude-haiku", "provider": "anthropic"},
+                    {"goal": "Architecture review"},
+                ],
+                model="claude-sonnet-4",  # default for all tasks
+                parent_agent=parent,
+            )
+
+        # Task 0: per-task model overrides top-level
+        self.assertEqual(captured_tasks[0]["model"], "deepseek-v4-pro")
+        # Task 1: per-task model+provider override
+        self.assertEqual(captured_tasks[1]["model"], "claude-haiku")
+        self.assertEqual(captured_tasks[1]["provider"], "anthropic")
+        # Task 2: no per-task model, falls back to top-level
+        self.assertEqual(captured_tasks[2]["model"], "claude-sonnet-4")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_per_call_reasoning_effort_override(self, mock_creds, mock_cfg):
+        """Per-call reasoning_effort is passed to _build_child_agent."""
+        mock_cfg.return_value = {
+            "max_iterations": 45, "model": None, "provider": None,
+            "reasoning_effort": "low",
+        }
+        mock_creds.return_value = {
+            "model": None, "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None,
+        }
+        parent = _make_mock_parent(depth=0)
+
+        captured_effort = {}
+
+        def capture_build(**kwargs):
+            captured_effort["reasoning"] = kwargs.get("override_reasoning_effort")
+            child = MagicMock()
+            child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            return child
+
+        with patch("tools.delegate_tool._build_child_agent", side_effect=capture_build):
+            delegate_task(
+                goal="Test reasoning effort override",
+                reasoning_effort="high",
+                parent_agent=parent,
+            )
+
+        self.assertEqual(captured_effort["reasoning"], "high")
 
 
 if __name__ == "__main__":

@@ -1086,6 +1086,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Per-call reasoning effort override.
+    override_reasoning_effort: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1295,27 +1297,42 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: per-call override > delegation config > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
-    try:
-        # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
-        # False (``reasoning_effort: false``) to "" and inherit the parent
-        # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
+    if override_reasoning_effort:
+        try:
             from hermes_constants import parse_reasoning_effort
-
-            parsed = parse_reasoning_effort(delegation_effort)
+            parsed = parse_reasoning_effort(override_reasoning_effort)
             if parsed is not None:
                 child_reasoning = parsed
             else:
                 logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
+                    "Unknown per-call reasoning_effort '%s', falling back to config/parent",
+                    override_reasoning_effort,
                 )
-    except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+        except Exception as exc:
+            logger.debug("Could not parse per-call reasoning_effort '%s': %s",
+                         override_reasoning_effort, exc)
+    else:
+        try:
+            # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
+            # False (``reasoning_effort: false``) to "" and inherit the parent
+            # instead of disabling thinking for children.
+            delegation_effort = delegation_cfg.get("reasoning_effort")
+            if delegation_effort or delegation_effort is False:
+                from hermes_constants import parse_reasoning_effort
+
+                parsed = parse_reasoning_effort(delegation_effort)
+                if parsed is not None:
+                    child_reasoning = parsed
+                else:
+                    logger.warning(
+                        "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                        delegation_effort,
+                    )
+        except Exception as exc:
+            logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
@@ -2436,6 +2453,9 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2604,6 +2624,15 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+
+            # ── Per-call model/provider/reasoning_effort override ──────
+            # Resolution order: per-task > top-level call arg > config > parent inherit.
+            # When top-level model is set, it becomes the default for all tasks.
+            # Per-task model/provider overrides both the top-level and the config.
+            effective_model = t.get("model") or model or creds["model"]
+            effective_provider_override = t.get("provider") or provider or creds["provider"]
+            effective_reasoning_effort = t.get("reasoning_effort") or reasoning_effort or None
+
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2611,11 +2640,11 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=effective_model,
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
+                override_provider=effective_provider_override,
                 override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
@@ -2624,6 +2653,7 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                override_reasoning_effort=effective_reasoning_effort,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -3589,6 +3619,33 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model override for all subagents in this call. "
+                    "When set, overrides delegation.model config and the parent "
+                    "session model. Per-task model takes priority when both are set. "
+                    "Format: provider/model (e.g. 'anthropic/claude-sonnet-4') or "
+                    "bare model name (uses delegation.provider or parent provider)."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Optional provider override for all subagents in this call. "
+                    "When set, overrides delegation.provider config. Must be a "
+                    "configured provider name (e.g. 'openrouter', 'anthropic'). "
+                    "Per-task provider takes priority when both are set."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "description": (
+                    "Optional reasoning effort override for subagents. "
+                    "Values: 'low', 'medium', 'high', 'max'. "
+                    "When set, overrides delegation.reasoning_effort config."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3603,6 +3660,28 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Optional per-task model override. "
+                                "Overrides top-level model and delegation.model config. "
+                                "Format: provider/model or bare model name."
+                            ),
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": (
+                                "Optional per-task provider override. "
+                                "Overrides top-level provider and delegation.provider config."
+                            ),
+                        },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "description": (
+                                "Optional per-task reasoning effort override. "
+                                "Overrides top-level reasoning_effort."
+                            ),
                         },
                     },
                     "required": ["goal"],
@@ -3689,6 +3768,9 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
+        model=args.get("model"),
+        provider=args.get("provider"),
+        reasoning_effort=args.get("reasoning_effort"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
